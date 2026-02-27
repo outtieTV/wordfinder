@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Scrabble Word Finder</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.min.js"></script>
+
+<style>
+:root {
+    --primary: #007bff;
+    --primary-hover: #0056b3;
+    --danger: #e74c3c;
+    --bg: #f2f4f7;
+    --text: #333;
+}
+
+body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: var(--bg);
+    margin: 20px;
+    color: var(--text);
+    text-align: center;
+}
+
+h1 { color: #2c3e50; margin-bottom: 5px; }
+#status { margin-bottom: 20px; color: #666; font-style: italic; font-size: 0.9em; }
+
+input, button {
+    padding: 12px;
+    font-size: 16px;
+    border-radius: 8px;
+    border: 1px solid #ccc;
+    margin: 4px;
+    box-sizing: border-box;
+}
+
+input:focus { border-color: var(--primary); outline: none; }
+
+button {
+    background: var(--primary);
+    color: white;
+    border: none;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+button:hover { background: var(--primary-hover); }
+button:disabled { background: #ccc; cursor: not-allowed; }
+
+#advanced {
+    display: none;
+    background: white;
+    padding: 15px;
+    border-radius: 10px;
+    max-width: 500px;
+    margin: 10px auto;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+
+.position-row {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    margin: 8px 0;
+}
+
+.remove { background: var(--danger); padding: 5px 12px; }
+
+/* Collapsible Styles */
+.collapsible {
+    background-color: white;
+    color: #2c3e50;
+    cursor: pointer;
+    padding: 18px;
+    width: 100%;
+    max-width: 800px;
+    border: none;
+    text-align: left;
+    outline: none;
+    font-size: 1.1em;
+    font-weight: bold;
+    border-radius: 10px;
+    margin-top: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+}
+
+.collapsible:after {
+    content: '\25BC';
+    font-size: 0.8em;
+    color: #999;
+}
+
+.collapsible.active:after { content: '\25B2'; }
+
+.collapsible.active { border-radius: 10px 10px 0 0; border-bottom: 1px solid #eee; }
+
+.content {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.2s ease-out;
+    background-color: white;
+    max-width: 800px;
+    margin: 0 auto;
+    border-radius: 0 0 10px 10px;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+
+th, td {
+    padding: 12px;
+    border-bottom: 1px solid #eee;
+    text-align: center;
+}
+
+th { background: #fafafa; font-size: 0.9em; color: #777; }
+
+.blank { color: var(--danger); font-weight: bold; text-decoration: underline; }
+
+#results-container { margin-top: 20px; }
+
+.count-badge {
+    background: #e9ecef;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 0.8em;
+    color: var(--primary);
+}
+
+a { text-decoration: none; color: inherit; }
+tr:hover { background-color: #f8f9fa; }
+</style>
+</head>
+
+<body>
+
+<h1>Scrabble Word Finder</h1>
+<div id="status">Initializing engine...</div>
+
+<div id="controls">
+    <input id="rack" maxlength="15" placeholder="Rack (use ? for blank)">
+    <br>
+    <button onclick="toggleAdvanced()">Advanced Filters</button>
+    <div id="advanced">
+        <input id="start" placeholder="Starts With">
+        <input id="end" placeholder="Ends With">
+        <input id="contains" placeholder="Contains">
+        <br>
+        <button onclick="addPosition()">+ Add Position (Board Tiles)</button>
+        <div id="position-list"></div>
+    </div>
+    <br>
+    <button id="findBtn" onclick="findWords()" disabled>Find Words</button>
+    <button onclick="clearAll()">Clear All</button>
+</div>
+
+<div id="results-container"></div>
+
+<script>
+let db, SQL;
+const DBNAME = "scrabble_indexeddb_v2";
+let filterID = 0;
+
+/* =========================
+DB Logic (WASM + IndexedDB)
+=========================*/
+const scoreMap = {a:1,b:3,c:3,d:2,e:1,f:4,g:2,h:4,i:1,j:8,k:5,l:1,m:3,n:1,o:1,p:3,q:10,r:1,s:1,t:1,u:1,v:4,w:4,x:8,y:4,z:10};
+
+function getScore(w) {
+    let s = 0;
+    for (const c of w) s += scoreMap[c] || 0;
+    return s;
+}
+
+async function initDB() {
+    try {
+        SQL = await initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${f}` });
+        const saved = await loadFromIndexedDB();
+
+        if (saved) {
+            db = new SQL.Database(saved);
+            statusUpdate("Ready ✔");
+        } else {
+            statusUpdate("First run: Downloading dictionary...");
+            db = new SQL.Database();
+            db.run("CREATE TABLE words(word TEXT, length INTEGER, score INTEGER)");
+
+            const resp = await fetch("NWL2023_modified.txt");
+            if (!resp.ok) throw new Error("File not found");
+            const txt = await resp.text();
+
+            statusUpdate("Building index...");
+            db.run("BEGIN");
+            const stmt = db.prepare("INSERT INTO words VALUES (?,?,?)");
+            txt.split("\n").forEach(line => {
+                const w = line.trim().toLowerCase();
+                if (/^[a-z]+$/.test(w)) stmt.run([w, w.length, getScore(w)]);
+            });
+            stmt.free();
+            db.run("COMMIT");
+
+            await saveToIndexedDB();
+            statusUpdate("Ready ✔");
+        }
+        document.getElementById("findBtn").disabled = false;
+    } catch (e) { statusUpdate("Error: " + e.message); }
+}
+
+function saveToIndexedDB() {
+    return new Promise(r => {
+        const open = indexedDB.open(DBNAME, 1);
+        open.onupgradeneeded = e => e.target.result.createObjectStore("db");
+        open.onsuccess = e => {
+            const tx = e.target.result.transaction("db", "readwrite");
+            tx.objectStore("db").put(db.export(), "sqlite");
+            tx.oncomplete = () => r();
+        };
+    });
+}
+
+function loadFromIndexedDB() {
+    return new Promise(r => {
+        const open = indexedDB.open(DBNAME, 1);
+        open.onupgradeneeded = e => e.target.result.createObjectStore("db");
+        open.onsuccess = e => {
+            const tx = e.target.result.transaction("db", "readonly");
+            const req = tx.objectStore("db").get("sqlite");
+            req.onsuccess = () => r(req.result);
+        };
+    });
+}
+
+/* =========================
+Word Logic
+=========================*/
+function canForm(word, rack) {
+    let letters = {};
+    for (const c of rack) letters[c] = (letters[c] || 0) + 1;
+    let blanks = letters["?"] || 0;
+    let subs = {};
+
+    for (let i = 0; i < word.length; i++) {
+        let c = word[i];
+        if (letters[c] > 0) { letters[c]--; }
+        else if (blanks > 0) { blanks--; subs[i] = c; }
+        else return null;
+    }
+    return subs;
+}
+
+function findWords() {
+    const rackVal = document.getElementById("rack").value.toLowerCase().replace(/[^a-z?]/g, '');
+    const startVal = document.getElementById("start").value.toLowerCase().trim();
+    const endVal = document.getElementById("end").value.toLowerCase().trim();
+    const containsVal = document.getElementById("contains").value.toLowerCase().trim();
+
+    let sql = "SELECT * FROM words WHERE 1=1";
+    if (startVal) sql += ` AND word LIKE '${startVal}%'`;
+    if (endVal) sql += ` AND word LIKE '%${endVal}'`;
+    if (containsVal) sql += ` AND word LIKE '%${containsVal}%'`;
+
+    const queryResults = db.exec(sql);
+    if (!queryResults.length) return renderGrouped({});
+
+    const posRows = document.querySelectorAll(".position-row");
+    const grouped = {};
+
+    for (const r of queryResults[0].values) {
+        const word = r[0];
+        let valid = true;
+        
+        // Positional Board Tile Logic
+        let fixedIndices = [];
+        posRows.forEach(row => {
+            const p = parseInt(row.children[0].value);
+            const l = row.children[1].value.toLowerCase().trim();
+            if (p && l) {
+                if (word[p - 1] !== l) valid = false;
+                else fixedIndices.push(p - 1);
+            }
+        });
+        if (!valid) continue;
+
+        // Strip board tiles from the word before checking rack
+        let neededFromRack = "";
+        for(let i=0; i<word.length; i++) {
+            if(!fixedIndices.includes(i)) neededFromRack += word[i];
+        }
+
+        const subsRaw = canForm(neededFromRack, rackVal);
+        if (subsRaw === null) continue;
+
+        // Map back subs
+        let subs = {};
+        let neededPtr = 0;
+        for(let i=0; i<word.length; i++) {
+            if(!fixedIndices.includes(i)) {
+                if(subsRaw[neededPtr]) subs[i] = word[i];
+                neededPtr++;
+            }
+        }
+
+        const len = r[1];
+        if (!grouped[len]) grouped[len] = [];
+        grouped[len].push({ word, score: r[2], subs });
+    }
+    renderGrouped(grouped);
+}
+
+/* =========================
+UI Rendering
+=========================*/
+function renderGrouped(grouped) {
+    const container = document.getElementById("results-container");
+    container.innerHTML = "";
+
+    const sortedLengths = Object.keys(grouped).map(Number).sort((a, b) => b - a);
+
+    if (sortedLengths.length === 0) {
+        container.innerHTML = "<p>No matches found.</p>";
+        return;
+    }
+
+    sortedLengths.forEach(len => {
+        const words = grouped[len];
+        // Sort within length by Score DESC, then Alphabetical
+        words.sort((a, b) => b.score - a.score || a.word.localeCompare(b.word));
+
+        const btn = document.createElement("button");
+        btn.className = "collapsible";
+        btn.innerHTML = `<span>${len}-Letter Words</span> <span class="count-badge">${words.length}</span>`;
+
+        const content = document.createElement("div");
+        content.className = "content";
+
+        let tableHtml = `<table><thead><tr><th>Word</th><th>Score</th></tr></thead><tbody>`;
+        words.forEach(w => {
+            const display = [...w.word].map((c, i) => w.subs[i] ? `<span class="blank">${c}</span>` : c).join("");
+            tableHtml += `<tr>
+                <td><a href="https://en.wiktionary.org/wiki/${w.word}" target="_blank">${display}</a></td>
+                <td>${w.score}</td>
+            </tr>`;
+        });
+        tableHtml += `</tbody></table>`;
+        content.innerHTML = tableHtml;
+
+        container.appendChild(btn);
+        container.appendChild(content);
+
+        btn.onclick = function() {
+            this.classList.toggle("active");
+            const panel = this.nextElementSibling;
+            if (panel.style.maxHeight) {
+                panel.style.maxHeight = null;
+            } else {
+                panel.style.maxHeight = panel.scrollHeight + "px";
+            }
+        };
+    });
+}
+
+function toggleAdvanced() {
+    const a = document.getElementById("advanced");
+    a.style.display = (a.style.display === "block") ? "none" : "block";
+}
+
+function clearAll() {
+    document.querySelectorAll("input").forEach(i => i.value = "");
+    document.getElementById("position-list").innerHTML = "";
+    document.getElementById("results-container").innerHTML = "";
+}
+
+function addPosition() {
+    const id = "p" + (filterID++);
+    const row = document.createElement("div");
+    row.className = "position-row";
+    row.id = id;
+    row.innerHTML = `
+        <input type="number" min="1" max="15" placeholder="Pos" style="width:60px">
+        <input type="text" maxlength="1" placeholder="Tile" style="width:60px">
+        <button class="remove" onclick="document.getElementById('${id}').remove()">X</button>
+    `;
+    document.getElementById("position-list").appendChild(row);
+}
+
+function statusUpdate(t) { document.getElementById("status").innerText = t; }
+
+document.addEventListener("keypress", e => { if (e.key === "Enter") findWords(); });
+
+initDB();
+</script>
+
+</body>
+</html>
